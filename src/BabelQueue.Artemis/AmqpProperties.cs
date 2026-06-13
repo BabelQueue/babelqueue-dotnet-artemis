@@ -10,18 +10,19 @@ namespace BabelQueue.Artemis;
 /// Projects the envelope's contract fields onto the AMQP 1.0 message a JMS peer reads, and reads
 /// them back. Body = envelope JSON; <c>correlation-id</c> = <c>trace_id</c> (JMSCorrelationID);
 /// <c>creation-time</c> = <c>meta.created_at</c> (JMSTimestamp); the <c>x-opt-jms-type</c>
-/// message annotation = URN (JMSType, the AMQP-JMS mapping); plus the <c>bq-</c> application
-/// properties (string-valued, matching the Java JMS <c>setStringProperty</c> projection). A
-/// positive delay sets the <c>x-opt-delivery-time</c> annotation Artemis honours for scheduled
-/// delivery. The body stays authoritative (Contract §7.2).
+/// message annotation = URN (JMSType, the AMQP-JMS mapping); plus the <c>bq_</c> application
+/// properties (string-valued). The names use <strong>underscores</strong>, not hyphens: a JMS
+/// property name must be a valid Java identifier, and every Artemis SDK uses the same JMS-legal
+/// form for cross-protocol parity. A positive delay sets the <c>x-opt-delivery-time</c>
+/// annotation Artemis honours for scheduled delivery. The body stays authoritative (Contract §7.2).
 /// </summary>
 internal static class AmqpProperties
 {
-    public const string SchemaVersion = "bq-schema-version";
-    public const string SourceLang = "bq-source-lang";
-    public const string Attempts = "bq-attempts";
-    public const string AppId = "bq-app-id";
-    public const string Delay = "bq-delay";
+    public const string SchemaVersion = "bq_schema_version";
+    public const string SourceLang = "bq_source_lang";
+    public const string Attempts = "bq_attempts";
+    public const string AppId = "bq_app_id";
+    public const string Delay = "bq_delay";
     public const string AppIdValue = "babelqueue";
 
     private static readonly Symbol JmsType = new("x-opt-jms-type");
