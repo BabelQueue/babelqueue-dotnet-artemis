@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+coverage.cobertura.xml
+coverage.json
+artifacts/
+
+# CommitBrief local config and cache
+.commitbrief/
