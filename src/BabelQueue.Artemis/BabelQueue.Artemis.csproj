@@ -13,7 +13,7 @@
     <AnalysisLevel>latest-recommended</AnalysisLevel>
 
     <PackageId>BabelQueue.Artemis</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <Authors>Muhammet Şafak</Authors>
     <Company>BabelQueue</Company>
     <Description>Apache ActiveMQ Artemis transport for BabelQueue — a canonical-envelope publisher and a URN-routed AMQP 1.0 consumer (accept/release settlement, native scheduled delivery, cross-language DLQ) over AMQPNetLite, on the framework-agnostic core.</Description>

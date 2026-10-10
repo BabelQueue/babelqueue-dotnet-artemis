@@ -43,6 +43,9 @@ public sealed class ArtemisConsumerTests
         receiver.Setup(r => r.ReceiveAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>())).ReturnsAsync(message);
         receiver.Setup(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         receiver.Setup(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        receiver
+            .Setup(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
         return receiver;
     }
 
@@ -149,6 +152,7 @@ public sealed class ArtemisConsumerTests
         Assert.Equal(0, calls);
         receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
         receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
         Assert.Equal(2, reported.Count);
         Assert.IsType<InvalidOperationException>(reported[1].InnerException);
     }
@@ -198,6 +202,7 @@ public sealed class ArtemisConsumerTests
         Assert.Equal(0, calls);
         receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
         receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -242,17 +247,128 @@ public sealed class ArtemisConsumerTests
     }
 
     [Fact]
-    public async Task ThrowingHandlerReleasesForRedelivery()
+    public async Task ThrowingHandlerSettlesModifiedDeliveryFailedForRedelivery()
     {
-        var receiver = ReceiverWith(Incoming(Body(0), Urn, 0)); // first delivery fails → release
+        var receiver = ReceiverWith(Incoming(Body(0), Urn, 0)); // first delivery fails → modified{delivery-failed}
         Exception? reported = null;
         var options = new ArtemisConsumerOptions { MaxTries = 3, OnError = (e, _, _) => reported = e };
 
         await new ArtemisConsumer(receiver.Object, Handler(_ => { }, @throw: true), options).PollAsync();
 
         Assert.IsType<InvalidOperationException>(reported);
-        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(
+            r => r.ModifyAsync(It.IsAny<Message>(), true, false, It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
         receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    /// <summary>
+    /// A tiny in-memory broker honouring Artemis's counting rule: a <i>modified</i> outcome with
+    /// <c>delivery-failed</c> bumps <c>delivery-count</c> on redelivery, a plain <i>released</i> one does not.
+    /// </summary>
+    private sealed class RedeliveringReceiver : IAmqpReceiver
+    {
+        private readonly string _body;
+        private uint _deliveryCount;
+        private bool _pending = true;
+
+        public RedeliveringReceiver(string body) => _body = body;
+
+        public int Accepts { get; private set; }
+
+        public int Releases { get; private set; }
+
+        public int Modifies { get; private set; }
+
+        public Task<Message?> ReceiveAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+        {
+            if (!_pending)
+            {
+                return Task.FromResult<Message?>(null);
+            }
+
+            _pending = false;
+            var message = Incoming(_body, Urn, _deliveryCount);
+            return Task.FromResult<Message?>(message);
+        }
+
+        public Task AcceptAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            Accepts++;
+            return Task.CompletedTask;
+        }
+
+        public Task ReleaseAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            Releases++;
+            _pending = true; // requeued, counter untouched
+            return Task.CompletedTask;
+        }
+
+        public Task ModifyAsync(
+            Message message, bool deliveryFailed, bool undeliverableHere = false, CancellationToken cancellationToken = default)
+        {
+            Modifies++;
+            _pending = true;
+            if (deliveryFailed)
+            {
+                _deliveryCount++;
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task ThrowingHandlerReachesMaxTriesAndDeadLettersAsDeliveryCountRises()
+    {
+        var receiver = new RedeliveringReceiver(Body(0));
+        var (dlq, sent) = DlqSender();
+        var calls = new List<int>();
+        var options = new ArtemisConsumerOptions { MaxTries = 3, DeadLetterSender = dlq.Object };
+        var consumer = new ArtemisConsumer(receiver, Handler(e => calls.Add(e.Attempts), @throw: true), options);
+
+        var polls = 0;
+        while (await consumer.PollAsync() == 1 && ++polls < 20)
+        {
+        }
+
+        Assert.Equal(new[] { 0, 1, 2 }, calls); // attempts follow the broker's delivery-count: 0, 1, 2
+        Assert.Equal(2, receiver.Modifies);
+        Assert.Equal(0, receiver.Releases);
+        Assert.Equal(1, receiver.Accepts);
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        var dead = EnvelopeCodec.Decode(AmqpProperties.Text(sent()!));
+        Assert.Equal("failed", dead.DeadLetter!.Reason);
+        Assert.Equal(2, dead.Attempts);
+    }
+
+    /// <summary>An implementer written before <c>ModifyAsync</c> existed: only the original three members.</summary>
+    private sealed class LegacyReceiver : IAmqpReceiver
+    {
+        public int Releases { get; private set; }
+
+        public Task<Message?> ReceiveAsync(TimeSpan timeout, CancellationToken cancellationToken = default) =>
+            Task.FromResult<Message?>(null);
+
+        public Task AcceptAsync(Message message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task ReleaseAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            Releases++;
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task ModifyAsyncDefaultImplementationFallsBackToReleaseForLegacyReceivers()
+    {
+        var legacy = new LegacyReceiver();
+        IAmqpReceiver receiver = legacy;
+
+        await receiver.ModifyAsync(new Message("x"), deliveryFailed: true);
+
+        Assert.Equal(1, legacy.Releases);
     }
 
     [Fact]
@@ -327,6 +443,7 @@ public sealed class ArtemisConsumerTests
         await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), options).PollAsync();
 
         receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

@@ -21,8 +21,10 @@ public interface IAmqpSender
 /// <summary>
 /// A receive seam over one Artemis address — the consumer depends on this, not on the concrete
 /// AMQPNetLite <see cref="ReceiverLink"/>. <see cref="AcceptAsync"/> settles a message
-/// (acknowledge); <see cref="ReleaseAsync"/> returns it for redelivery (the broker increments
-/// the AMQP <c>delivery-count</c>). Wrap a real link with <see cref="AmqpReceiverLink"/>.
+/// (acknowledge); <see cref="ReleaseAsync"/> returns it for redelivery <b>without</b> bumping the
+/// AMQP <c>delivery-count</c> (Artemis cancels a <i>released</i> delivery without counting it);
+/// <see cref="ModifyAsync"/> with <c>deliveryFailed: true</c> returns it for redelivery <b>and</b>
+/// increments the <c>delivery-count</c>. Wrap a real link with <see cref="AmqpReceiverLink"/>.
 /// </summary>
 public interface IAmqpReceiver
 {
@@ -32,8 +34,26 @@ public interface IAmqpReceiver
     /// <summary>Settle (acknowledge) the message — it is removed from the queue.</summary>
     Task AcceptAsync(Message message, CancellationToken cancellationToken = default);
 
-    /// <summary>Release the message for redelivery — the broker increments <c>delivery-count</c>.</summary>
+    /// <summary>
+    /// Release the message for redelivery as a plain AMQP <i>released</i> outcome — the broker does
+    /// <b>not</b> increment <c>delivery-count</c>.
+    /// </summary>
     Task ReleaseAsync(Message message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Settle the message with an AMQP <i>modified</i> outcome. With <paramref name="deliveryFailed"/>
+    /// the broker increments <c>delivery-count</c> on redelivery; <paramref name="undeliverableHere"/>
+    /// asks it not to redeliver to this link. Added as a default interface method so existing
+    /// <see cref="IAmqpReceiver"/> implementations keep compiling; the default falls back to
+    /// <see cref="ReleaseAsync"/> (which does not bump the counter), so a custom receiver must override
+    /// it for <c>MaxTries</c> to be reached on a throwing handler. <see cref="AmqpReceiverLink"/> does.
+    /// </summary>
+    Task ModifyAsync(
+        Message message,
+        bool deliveryFailed,
+        bool undeliverableHere = false,
+        CancellationToken cancellationToken = default) =>
+        ReleaseAsync(message, cancellationToken);
 }
 
 /// <summary>Adapts an AMQPNetLite <see cref="SenderLink"/> to <see cref="IAmqpSender"/>.</summary>
@@ -83,6 +103,16 @@ public sealed class AmqpReceiverLink : IAmqpReceiver
     public Task ReleaseAsync(Message message, CancellationToken cancellationToken = default)
     {
         _link.Release(message);
+        return Task.CompletedTask;
+    }
+
+    public Task ModifyAsync(
+        Message message,
+        bool deliveryFailed,
+        bool undeliverableHere = false,
+        CancellationToken cancellationToken = default)
+    {
+        _link.Modify(message, deliveryFailed, undeliverableHere);
         return Task.CompletedTask;
     }
 }

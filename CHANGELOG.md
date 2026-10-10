@@ -9,11 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-10-10
+## [1.1.0] - 2026-10-10
+
+### Added
+- `IAmqpReceiver.ModifyAsync(message, deliveryFailed, undeliverableHere = false, cancellationToken)` — settles a message with an AMQP *modified* outcome (`deliveryFailed: true` makes the broker increment `delivery-count`). It is a **default interface method** that falls back to `ReleaseAsync`, so existing `IAmqpReceiver` implementations keep compiling (source and binary compatible). **Custom receivers must override `ModifyAsync`** (as `AmqpReceiverLink` does, via `ReceiverLink.Modify`), otherwise a throwing handler still redelivers without bumping the counter and `MaxTries` is never reached on that receiver.
 
 ### Fixed
 - `ArtemisConsumer` now checks the `bq_schema_version` AMQP application property (underscores, ADR-0017) **before** decoding the body (§7.7). A value other than exactly `"1"` (ordinal, untrimmed) is forwarded raw to `<queue>.dlq` and then accepted, without decoding (a no-op forward when no `DeadLetterSender` is configured, so the message is just accepted). Absent or blank (empty / ASCII whitespace) falls through to the normal decode. No public API change.
 - The schema-version gate no longer loses a message when the DLQ write fails: `ArtemisConsumer` now `Release`s it for redelivery instead of letting the exception escape, reports via `OnError`, backs off for one `ReceiveTimeout` and `RunAsync` keeps running; the message is never accepted and never reaches a handler. `OnError` is invoked **after** the Accept / Release and isolated, so a throwing callback cannot leave the message unsettled or stop the loop. Other DLQ paths are unchanged. No public API change.
+- `ArtemisConsumer` no longer redelivers a throwing handler's message forever. The handler-failure path settled with a plain AMQP *released* outcome, which Artemis cancels **without** incrementing `delivery-count`, so `attempts = max(body, delivery-count)` never advanced, `MaxTries` was never reached and the message never made it to `<queue>.dlq`. It now settles `Modified{delivery-failed: true}` (`undeliverable-here: false`), which bumps the counter, so `MaxTries` is reached and the existing terminal DLQ path runs. The schema-version-gate DLQ-write-failure path and the `release` unknown-URN strategy intentionally stay a plain `Release` (counter not bumped). Note: because the counter now advances on handler failures, Artemis's native `max-delivery-attempts` (default 10) becomes reachable on this path — set it to at least `MaxTries` on the address/queue, or the broker moves the message to its native DLA (verbatim, no `dead_letter` block) before `MaxTries` is reached. Wire envelope and §7 property names unchanged.
 
 ## [1.0.0] - 2026-06-13
 

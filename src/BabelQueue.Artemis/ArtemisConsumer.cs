@@ -6,13 +6,17 @@ namespace BabelQueue.Artemis;
 /// <summary>
 /// Receives from an Artemis address over AMQP 1.0, decodes and validates each message, routes it
 /// to the handler registered for its URN (read from the <c>x-opt-jms-type</c> annotation), and
-/// <c>Accept</c>s it on success. A throwing handler <c>Release</c>s the message so the broker
-/// redelivers it (incrementing the AMQP <c>delivery-count</c>); once max-tries is reached the
+/// <c>Accept</c>s it on success. A throwing handler settles the message with an AMQP
+/// <c>Modified{delivery-failed: true}</c> outcome so the broker redelivers it <i>and</i> increments the AMQP
+/// <c>delivery-count</c> (a plain <c>Release</c> would not bump it, so max-tries would never be reached); once max-tries is reached the
 /// envelope goes to <c>&lt;queue&gt;.dlq</c> with a <c>dead_letter</c> block. <c>attempts</c> is
 /// reconciled to <c>max(body, delivery-count)</c> — the AMQP counter is 0-based (0 on first
 /// delivery), so it maps directly with no −1 (the Java JMS binding reads the 1-based
-/// <c>JMSXDeliveryCount</c> and subtracts 1, arriving at the same 0-based <c>attempts</c>). The
-/// loop never stops on a bad message — observe via <see cref="ArtemisConsumerOptions.OnError"/>.
+/// <c>JMSXDeliveryCount</c> and subtracts 1, arriving at the same 0-based <c>attempts</c>).
+/// Because the counter now advances on handler failures, the broker's native <c>max-delivery-attempts</c> must be
+/// set to at least <see cref="ArtemisConsumerOptions.MaxTries"/>, or the broker dead-letters first (verbatim, no
+/// <c>dead_letter</c> block).
+/// The consume loop never stops on a bad message — observe via <see cref="ArtemisConsumerOptions.OnError"/>.
 /// Before decoding, the <c>bq_schema_version</c> application property is checked (§7.7): absent or blank
 /// decodes normally, any value other than <c>"1"</c> sends the raw message to the DLQ without decoding
 /// it, then <c>Accept</c>s it. If that DLQ write fails the message is <b>not</b> accepted: it is
@@ -228,8 +232,11 @@ public sealed class ArtemisConsumer
     {
         if (envelope.Attempts + 1 < _options.MaxTries)
         {
-            // Release leaves it unsettled for redelivery — the broker increments delivery-count.
-            await _receiver.ReleaseAsync(message, cancellationToken).ConfigureAwait(false);
+            // Modified{delivery-failed} requeues it AND makes the broker increment delivery-count, so
+            // attempts = max(body, delivery-count) advances and MaxTries is eventually reached. A plain
+            // Release would not bump the counter (Artemis cancels it without counting) → endless redelivery.
+            await _receiver.ModifyAsync(message, deliveryFailed: true, undeliverableHere: false, cancellationToken)
+                .ConfigureAwait(false);
         }
         else if (_options.DeadLetterSender is not null)
         {
