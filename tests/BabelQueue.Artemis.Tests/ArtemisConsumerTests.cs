@@ -123,6 +123,83 @@ public sealed class ArtemisConsumerTests
         receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    public async Task SchemaVersionGateDlqFailureReleasesDoesNotAcceptAndLoopSurvives(string version)
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), version));
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders.dlq");
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dlq down"));
+        var reported = new List<Exception>();
+        var calls = 0;
+        var options = new ArtemisConsumerOptions
+        {
+            DeadLetterSender = sender.Object,
+            ReceiveTimeout = TimeSpan.FromMilliseconds(1),
+            OnError = (e, _, _) => reported.Add(e),
+        };
+
+        var count = await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), options).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(2, reported.Count);
+        Assert.IsType<InvalidOperationException>(reported[1].InnerException);
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateThrowingOnErrorStillAcceptsAfterSuccessfulDeadLetter()
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders.dlq");
+        var calls = 0;
+        var options = new ArtemisConsumerOptions
+        {
+            DeadLetterSender = sender.Object,
+            OnError = (_, _, _) => throw new InvalidOperationException("observer exploded"),
+        };
+
+        var count = await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), options).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        sender.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateThrowingOnErrorStillReleasesAfterDeadLetterFailure()
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders.dlq");
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dlq down"));
+        var calls = 0;
+        var options = new ArtemisConsumerOptions
+        {
+            DeadLetterSender = sender.Object,
+            ReceiveTimeout = TimeSpan.FromMilliseconds(1),
+            OnError = (_, _, _) => throw new InvalidOperationException("observer exploded"),
+        };
+
+        var count = await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), options).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     [Fact]
     public async Task SuccessAcknowledges()
     {

@@ -87,7 +87,7 @@ redelivers and bumps `delivery-count`); once `MaxTries` is reached the envelope 
 (falling back to the body URN), so it never decodes a message it cannot handle. Unknown-URN
 strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 
-**Schema-version gate.** Before decoding, the consumer reads the `bq_schema_version` application property (underscores — ADR-0017). Absent or blank decodes as usual; any other value must be exactly `"1"`, otherwise the raw message is forwarded to `<queue>.dlq` and accepted without being decoded (with no `DeadLetterSender` configured the forward is a no-op, so the message is just accepted — it degrades to delete).
+**Schema-version gate.** Before decoding, the consumer reads the `bq_schema_version` application property (underscores — ADR-0017). Absent or blank decodes as usual; any other value must be exactly `"1"`, otherwise the raw message is forwarded to `<queue>.dlq` and accepted without being decoded (with no `DeadLetterSender` configured the forward is a no-op, so the message is just accepted — it degrades to delete). If the DLQ write itself fails, the message is **not** accepted: it is `Release`d for redelivery (a plain AMQP *released* outcome, not *modified / delivery-failed*), reported via `OnError` (after the settle; a throwing `OnError` cannot leave it unsettled), the consumer backs off for one `ReceiveTimeout` and `RunAsync` keeps running.
 
 > `AmqpSenderLink` / `AmqpReceiverLink` wrap the AMQPNetLite links; the publisher and consumer
 > depend on the `IAmqpSender` / `IAmqpReceiver` seams, so they unit-test against mocks with no

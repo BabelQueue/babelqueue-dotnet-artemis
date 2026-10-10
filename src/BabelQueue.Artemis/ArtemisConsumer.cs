@@ -15,7 +15,9 @@ namespace BabelQueue.Artemis;
 /// loop never stops on a bad message — observe via <see cref="ArtemisConsumerOptions.OnError"/>.
 /// Before decoding, the <c>bq_schema_version</c> application property is checked (§7.7): absent or blank
 /// decodes normally, any value other than <c>"1"</c> sends the raw message to the DLQ without decoding
-/// it, then <c>Accept</c>s it.
+/// it, then <c>Accept</c>s it. If that DLQ write fails the message is <b>not</b> accepted: it is
+/// <c>Release</c>d for redelivery, the failure is reported via <see cref="ArtemisConsumerOptions.OnError"/> and the
+/// loop keeps running.
 /// </summary>
 public sealed class ArtemisConsumer
 {
@@ -67,16 +69,44 @@ public sealed class ArtemisConsumer
                 EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
                 StringComparison.Ordinal))
         {
-            // The body is deliberately not decoded, so hand OnError an empty envelope. The raw message goes
-            // to the DLQ (same path as a poison body) and is then accepted.
-            _options.OnError?.Invoke(
-                new BabelQueueException(
-                    $"Rejected an Artemis message: unsupported {AmqpProperties.SchemaVersion} property "
-                    + $"'{declaredVersion}' (supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
-                new Envelope(null, null, null, null, 0, null),
-                message);
-            await DeadLetterRawAsync(message, cancellationToken).ConfigureAwait(false);
+            // The body is deliberately not decoded, so OnError gets an empty envelope. The raw message goes
+            // to the DLQ (same path as a poison body) and is then accepted. Settle FIRST, report afterwards:
+            // a throwing OnError must never leave the message unsettled or stop the loop (it is isolated).
+            var rejected = new BabelQueueException(
+                $"Rejected an Artemis message: unsupported {AmqpProperties.SchemaVersion} property "
+                + $"'{declaredVersion}' (supported: {EnvelopeCodec.SchemaVersion}); body not decoded.");
+            try
+            {
+                await DeadLetterRawAsync(message, cancellationToken).ConfigureAwait(false);
+            }
+#pragma warning disable CA1031 // A failed DLQ write must release the message, whatever the cause.
+            catch (Exception dlqError) when (dlqError is not OperationCanceledException)
+#pragma warning restore CA1031
+            {
+                // The gated message could not be parked: never Accept it. Release it for redelivery (it never
+                // reaches a handler: the gate rejects it again), report, and back off for one receive interval
+                // so a persistent DLQ failure doesn't spin. The loop keeps running.
+                await _receiver.ReleaseAsync(message, cancellationToken).ConfigureAwait(false);
+                SafeReport(rejected, message);
+                SafeReport(
+                    new BabelQueueException(
+                        "Failed to dead-letter a schema-version-gated Artemis message; released for redelivery, not accepted.",
+                        dlqError),
+                    message);
+                try
+                {
+                    await Task.Delay(_options.ReceiveTimeout, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Shutting down: the message is already released.
+                }
+
+                return;
+            }
+
             await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
+            SafeReport(rejected, message);
             return;
         }
 
@@ -109,6 +139,24 @@ public sealed class ArtemisConsumer
         {
             _options.OnError?.Invoke(error, envelope, message);
             await RetryOrDeadLetterAsync(message, envelope, error, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Invokes <see cref="ArtemisConsumerOptions.OnError"/> on the schema-version-gate path, where it must not be
+    /// able to disturb settlement: a throwing callback is swallowed so the already-performed Accept / Release
+    /// stands and <c>RunAsync</c> keeps running.
+    /// </summary>
+    private void SafeReport(Exception error, Message message)
+    {
+        try
+        {
+            _options.OnError?.Invoke(error, new Envelope(null, null, null, null, 0, null), message);
+        }
+#pragma warning disable CA1031 // A misbehaving observer must not leave the gated message unsettled.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
         }
     }
 
