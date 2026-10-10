@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -85,6 +86,56 @@ public sealed class ArtemisConformanceTests
             await new ArtemisConsumer(receiver.Object, handlers, new ArtemisConsumerOptions { MaxTries = 99 }).PollAsync();
 
             Assert.Equal(expected, seen);
+        }
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateMatchesGolden()
+    {
+        var gate = Artemis().GetProperty("schema_version_gate");
+        var property = gate.GetProperty("property").GetString()!;
+        var body = File.ReadAllText(Path.Combine(Dir, gate.GetProperty("fixture").GetString()!));
+        var job = EnvelopeCodec.Decode(body).Job!;
+
+        var cases = gate.GetProperty("cases").EnumerateArray().ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var absent = testCase.TryGetProperty("absent", out var a) && a.GetBoolean();
+            var value = absent ? null : testCase.GetProperty("value").GetString();
+            var expect = testCase.GetProperty("expect").GetString();
+
+            var message = new Message(body);
+            if (!absent)
+            {
+                message.ApplicationProperties = new ApplicationProperties();
+                message.ApplicationProperties.Map[property] = value;
+            }
+
+            var receiver = new Mock<IAmqpReceiver>();
+            receiver.Setup(r => r.ReceiveAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>())).ReturnsAsync(message);
+            receiver.Setup(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+            receiver.Setup(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+            var dlq = new Mock<IAmqpSender>();
+            var dlqSends = 0;
+            dlq.Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+                .Callback<Message, CancellationToken>((_, _) => dlqSends++)
+                .Returns(Task.CompletedTask);
+
+            var seen = 0;
+            var handlers = new Dictionary<string, BabelHandler>
+            {
+                [job] = (_, _, _) => { seen++; return Task.CompletedTask; },
+            };
+            await new ArtemisConsumer(receiver.Object, handlers, new ArtemisConsumerOptions { DeadLetterSender = dlq.Object }).PollAsync();
+
+            var label = absent ? "<absent>" : $"'{value}'";
+            Assert.True(
+                (expect == "decode" ? 1 : 0) == seen,
+                $"{label}: expected {expect} but handler ran {seen} time(s)");
+            Assert.Equal(expect == "decode" ? 0 : 1, dlqSends);
+            receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
         }
     }
 }

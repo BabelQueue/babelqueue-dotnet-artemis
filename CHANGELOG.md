@@ -7,6 +7,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Fixed
+- `ArtemisConsumer` now checks the `bq_schema_version` AMQP application property (underscores, ADR-0017) **before** decoding the body (§7.7). A value other than exactly `"1"` (ordinal, untrimmed) is forwarded raw to `<queue>.dlq` and then accepted, without decoding (a no-op forward when no `DeadLetterSender` is configured, so the message is just accepted). Absent or blank (empty / ASCII whitespace) falls through to the normal decode. No public API change.
+
 ## [1.0.0] - 2026-06-13
 
 ### Added

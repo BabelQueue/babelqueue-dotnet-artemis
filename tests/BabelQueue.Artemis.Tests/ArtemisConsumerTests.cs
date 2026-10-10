@@ -67,6 +67,62 @@ public sealed class ArtemisConsumerTests
         },
     };
 
+    private static Message WithSchemaVersion(string body, string? version)
+    {
+        var message = Incoming(body, Urn, 0);
+        if (version is not null)
+        {
+            message.ApplicationProperties = new ApplicationProperties();
+            message.ApplicationProperties.Map["bq_schema_version"] = version;
+        }
+
+        return message;
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" \t")]
+    [InlineData("1")]
+    public async Task AbsentBlankOrCurrentSchemaVersionPropertyDecodesAndRunsHandler(string? version)
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), version));
+        var calls = 0;
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => calls++)).PollAsync();
+
+        Assert.Equal(1, calls);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    [InlineData(" 1")]
+    public async Task UnsupportedSchemaVersionPropertyIsRejectedWithoutDecoding(string version)
+    {
+        // The body is not valid JSON, but the decoder does not throw on it (it yields an empty envelope that
+        // the Accepts() branch would also send to the DLQ with the same settle). The two paths differ only in
+        // the OnError message, which is what proves the property gate fired before the decoder ran.
+        const string body = "{ this is not json";
+        var receiver = ReceiverWith(WithSchemaVersion(body, version));
+        var (sender, sent) = DlqSender();
+        Exception? reported = null;
+        var calls = 0;
+        var options = new ArtemisConsumerOptions { DeadLetterSender = sender.Object, OnError = (e, _, _) => reported = e };
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), options).PollAsync();
+
+        Assert.Equal(0, calls);
+        Assert.NotNull(reported);
+        Assert.Contains("bq_schema_version", reported!.Message);
+        Assert.Contains($"'{version}'", reported.Message);
+        Assert.DoesNotContain("non-conformant", reported.Message);
+        Assert.Equal(body, AmqpProperties.Text(sent()!));
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     [Fact]
     public async Task SuccessAcknowledges()
     {

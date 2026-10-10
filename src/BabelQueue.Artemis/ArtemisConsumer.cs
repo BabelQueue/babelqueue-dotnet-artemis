@@ -1,3 +1,4 @@
+using System.Globalization;
 using Amqp;
 
 namespace BabelQueue.Artemis;
@@ -12,6 +13,9 @@ namespace BabelQueue.Artemis;
 /// delivery), so it maps directly with no −1 (the Java JMS binding reads the 1-based
 /// <c>JMSXDeliveryCount</c> and subtracts 1, arriving at the same 0-based <c>attempts</c>). The
 /// loop never stops on a bad message — observe via <see cref="ArtemisConsumerOptions.OnError"/>.
+/// Before decoding, the <c>bq_schema_version</c> application property is checked (§7.7): absent or blank
+/// decodes normally, any value other than <c>"1"</c> sends the raw message to the DLQ without decoding
+/// it, then <c>Accept</c>s it.
 /// </summary>
 public sealed class ArtemisConsumer
 {
@@ -54,6 +58,28 @@ public sealed class ArtemisConsumer
 
     private async Task HandleAsync(Message message, CancellationToken cancellationToken)
     {
+        // §7.7: version-gate on the bq_schema_version application property before decoding the body. The
+        // value is compared exactly as sent (no trimming), like the Pulsar/Go/Python/Node consumers (GR-5).
+        var declaredVersion = SchemaVersionValue(message);
+        if (declaredVersion is not null && !IsBlankSchemaVersion(declaredVersion)
+            && !string.Equals(
+                declaredVersion,
+                EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal))
+        {
+            // The body is deliberately not decoded, so hand OnError an empty envelope. The raw message goes
+            // to the DLQ (same path as a poison body) and is then accepted.
+            _options.OnError?.Invoke(
+                new BabelQueueException(
+                    $"Rejected an Artemis message: unsupported {AmqpProperties.SchemaVersion} property "
+                    + $"'{declaredVersion}' (supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
+                new Envelope(null, null, null, null, 0, null),
+                message);
+            await DeadLetterRawAsync(message, cancellationToken).ConfigureAwait(false);
+            await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         var envelope = Reconcile(EnvelopeCodec.Decode(AmqpProperties.Text(message)), message);
 
         if (!EnvelopeCodec.Accepts(envelope))
@@ -84,6 +110,38 @@ public sealed class ArtemisConsumer
             _options.OnError?.Invoke(error, envelope, message);
             await RetryOrDeadLetterAsync(message, envelope, error, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>The <c>bq_schema_version</c> application property as text, or null when absent.</summary>
+    private static string? SchemaVersionValue(Message message)
+    {
+        var properties = message.ApplicationProperties;
+        if (properties is not null
+            && properties.Map.TryGetValue(AmqpProperties.SchemaVersion, out var value)
+            && value is not null)
+        {
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// True when the declared schema version is empty or consists <b>only</b> of ASCII whitespace
+    /// (space, <c>\t</c>, <c>\n</c>, U+000B, <c>\f</c>, <c>\r</c>). Anything else (NBSP, U+0085, U+FEFF, …)
+    /// is <b>not</b> blank, unlike <see cref="string.IsNullOrWhiteSpace"/>.
+    /// </summary>
+    private static bool IsBlankSchemaVersion(string value)
+    {
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
