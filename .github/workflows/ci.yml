@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,6 +45,38 @@ jobs:
           diff -ru "$RUNNER_TEMP/conformance/fixtures"      "tests/BabelQueue.Artemis.Tests/conformance/fixtures"
           diff -ru "$RUNNER_TEMP/conformance/schema"        "tests/BabelQueue.Artemis.Tests/conformance/schema"
           echo "Vendored conformance is in sync with the canonical suite."
+
+  # Opt-in live-broker tests (Artemis service container). Runs on push to main and on manual
+  # dispatch only; it is deliberately NOT in `ci-green` needs, so it is never a required check.
+  integration:
+    name: Integration (live Artemis)
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      artemis:
+        image: apache/activemq-artemis:2.37.0
+        ports:
+          - 5672:5672
+          - 61616:61616
+        env:
+          ARTEMIS_USER: artemis
+          ARTEMIS_PASSWORD: artemis
+        options: >-
+          --health-cmd "/var/lib/artemis-instance/bin/artemis check node --up --user artemis --password artemis"
+          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Integration tests
+        env:
+          BQ_INTEGRATION: "1"
+          BQ_ARTEMIS_URL: amqp://artemis:artemis@localhost:5672
+        run: dotnet test -c Release --filter "FullyQualifiedName~ArtemisIntegrationTests"
 
   ci-green:
     name: CI green
