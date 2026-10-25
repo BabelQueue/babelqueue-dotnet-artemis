@@ -9,9 +9,28 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0037 decisions 1 and 2. The envelope stays at `schema_version: 1`; every change is a consumer-side settle
+decision. Ships as a **MINOR**.
+
+### Added
+
+- `ArtemisConsumerOptions.Queue`: the consumer's queue name for `dead_letter.original_queue` of a poison record (default: the
+  `DeadLetterSender` address without its `.dlq` suffix).
+
 ### Changed
 
-- Vendored conformance suite updated to v1.6.0 (tests only; no source or wire change, `schema_version` stays 1).
+- **Behaviour change: a poison body is written to `<queue>.dlq` as the ADR-0035 record.** Before, a non-conformant body was
+  forwarded raw (no `dead_letter` block, decoded with a lenient UTF-8 decode) and a failed write escaped the poll. Now a strict
+  JSON object is spliced byte for byte with a `dead_letter` block (`reason: "poison"`), anything else is wrapped as `raw`
+  (base64 plus `raw_encoding` for invalid UTF-8), via `BabelQueue.Core`'s `PoisonRecord`; the message is accepted only after
+  the write, a failed write `Release`s it (reported, one `ReceiveTimeout` backoff). Under `UnknownUrn = delete`, or with no
+  `DeadLetterSender`, it is accepted and dropped (a `Trace` warning). It never reaches a handler and is never retried.
+- **Behaviour change: the `bq_schema_version` gate follows ADR-0037 decision 1.** Under `UnknownUrn = delete` a gated message is
+  now accepted without a DLQ record (before, it was written even then); the raw body is copied as received (a binary body stays
+  binary instead of being re-encoded as text); with no `DeadLetterSender` it is accepted, dropped and logged. Only the
+  configured `UnknownUrn` strategy is read (`release` behaves as `fail`).
+- `BabelQueue.Core` dependency raised from `1.0.0` to `1.13.0` (`PoisonRecord`).
+- Vendored conformance suite updated to v1.8.0 (tests only; no wire change, `schema_version` stays 1); the runners cover the `poison_dlq` and `version_gate_artemis` sections.
 - CI pins the `fetch.sh` it downloads by sha256 (`BQ_FETCH_SH_SHA256`) before running it.
 
 ## [1.1.0] - 2026-10-10

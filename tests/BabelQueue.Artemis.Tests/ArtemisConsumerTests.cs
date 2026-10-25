@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using Amqp;
 using Amqp.Framing;
 using Amqp.Types;
@@ -398,18 +400,210 @@ public sealed class ArtemisConsumerTests
     }
 
     [Fact]
-    public async Task NonConformantForwardedRawToDlqAndAccepts()
+    public async Task NonConformantBodyIsWrittenAsAnAdr0035PoisonRecordAndAccepted()
     {
         var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
-        var (dlq, _) = DlqSender();
+        var (dlq, sent) = DlqSender();
         Exception? reported = null;
+        var calls = 0;
         var options = new ArtemisConsumerOptions { DeadLetterSender = dlq.Object, OnError = (e, _, _) => reported = e };
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), options).PollAsync();
+
+        Assert.Equal(0, calls);
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.NotNull(reported);
+        using var record = JsonDocument.Parse(AmqpProperties.Text(sent()!));
+        Assert.Equal("not-json", record.RootElement.GetProperty("raw").GetString());
+        var block = record.RootElement.GetProperty("dead_letter");
+        Assert.Equal("poison", block.GetProperty("reason").GetString());
+        Assert.Equal("orders", block.GetProperty("original_queue").GetString());
+    }
+
+    [Fact]
+    public async Task PoisonObjectIsSplicedByteForByteWithADeadLetterBlock()
+    {
+        const string body = "{\"job\":\"" + Urn + "\",  \"data\":{\"big\":1e400}}";
+        var receiver = ReceiverWith(Incoming(body, jmsType: Urn, deliveryCount: 3));
+        var (dlq, sent) = DlqSender();
+        var options = new ArtemisConsumerOptions { DeadLetterSender = dlq.Object, Queue = "orders-q" };
 
         await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), options).PollAsync();
 
-        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        var text = AmqpProperties.Text(sent()!);
+        Assert.StartsWith(body[..^1] + ",\"dead_letter\":", text, StringComparison.Ordinal);
+        using var record = JsonDocument.Parse(text);
+        var block = record.RootElement.GetProperty("dead_letter");
+        Assert.Equal("poison", block.GetProperty("reason").GetString());
+        Assert.Equal("orders-q", block.GetProperty("original_queue").GetString());
+        Assert.Equal(3, block.GetProperty("attempts").GetInt32());
         receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
-        Assert.NotNull(reported);
+    }
+
+    [Fact]
+    public async Task InvalidUtf8BodyIsWrappedAsBase64PoisonWithoutReplacementCharacters()
+    {
+        var bytes = new byte[] { 0x7B, 0xFF, 0xFE, 0x7D };
+        var message = new Message { BodySection = new Data { Binary = bytes } };
+        var receiver = ReceiverWith(message);
+        var (dlq, sent) = DlqSender();
+        var calls = 0;
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => calls++), new ArtemisConsumerOptions { DeadLetterSender = dlq.Object }).PollAsync();
+
+        Assert.Equal(0, calls);
+        using var record = JsonDocument.Parse(AmqpProperties.Text(sent()!));
+        Assert.Equal(Convert.ToBase64String(bytes), record.RootElement.GetProperty("raw").GetString());
+        Assert.Equal("base64", record.RootElement.GetProperty("raw_encoding").GetString());
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task IdentitylessObjectIsPoisonNotAnUnknownUrn()
+    {
+        var receiver = ReceiverWith(Incoming("{}", jmsType: null, deliveryCount: 0));
+        var (dlq, sent) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), new ArtemisConsumerOptions { DeadLetterSender = dlq.Object }).PollAsync();
+
+        using var record = JsonDocument.Parse(AmqpProperties.Text(sent()!));
+        Assert.Equal("poison", record.RootElement.GetProperty("dead_letter").GetProperty("reason").GetString());
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PoisonWithDeadLetteringOffIsAcceptedAndDropped()
+    {
+        var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>()).PollAsync();
+
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PoisonUnderDeleteStrategyIsAcceptedWithoutARecord()
+    {
+        var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
+        var (dlq, _) = DlqSender();
+        var options = new ArtemisConsumerOptions { DeadLetterSender = dlq.Object, UnknownUrn = UnknownUrnStrategy.Delete };
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PoisonWhoseDeadLetterWriteFailsIsReleasedNotAcceptedAndReported()
+    {
+        var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders.dlq");
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dlq down"));
+        var reported = new List<Exception>();
+        var options = new ArtemisConsumerOptions
+        {
+            DeadLetterSender = sender.Object,
+            ReceiveTimeout = TimeSpan.FromMilliseconds(1),
+            OnError = (e, _, _) => reported.Add(e),
+        };
+
+        var count = await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(1, count);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Equal(2, reported.Count);
+        Assert.IsType<InvalidOperationException>(reported[1].InnerException);
+    }
+
+    [Fact]
+    public async Task PoisonWithAThrowingOnErrorIsStillAcceptedAfterTheWrite()
+    {
+        var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
+        var (dlq, _) = DlqSender();
+        var options = new ArtemisConsumerOptions
+        {
+            DeadLetterSender = dlq.Object,
+            OnError = (_, _, _) => throw new InvalidOperationException("observer exploded"),
+        };
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData(UnknownUrnStrategy.Fail)]
+    [InlineData(UnknownUrnStrategy.Release)]
+    [InlineData(UnknownUrnStrategy.DeadLetter)]
+    public async Task VersionGatedMessageIsWrittenRawOnTheFirstDeliveryForEveryNonDeleteStrategy(string strategy)
+    {
+        // delivery-count 7 and MaxTries 2: the gate applies on the first delivery regardless of the counters.
+        var body = Body(5);
+        var message = WithSchemaVersion(body, "2");
+        message.Header = new Header { DeliveryCount = 7 };
+        var receiver = ReceiverWith(message);
+        var (dlq, sent) = DlqSender();
+        var options = new ArtemisConsumerOptions { DeadLetterSender = dlq.Object, UnknownUrn = strategy, MaxTries = 2 };
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }), options).PollAsync();
+
+        Assert.Equal(body, AmqpProperties.Text(sent()!));
+        Assert.DoesNotContain("dead_letter", AmqpProperties.Text(sent()!), StringComparison.Ordinal);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ModifyAsync(It.IsAny<Message>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task VersionGatedBinaryBodyIsWrittenAsTheSameBytes()
+    {
+        var bytes = Encoding.UTF8.GetBytes("{\n \"meta\": {\"schema_version\": 2} }\n");
+        var message = new Message { BodySection = new Data { Binary = bytes } };
+        message.ApplicationProperties = new ApplicationProperties();
+        message.ApplicationProperties.Map["bq_schema_version"] = "2";
+        var receiver = ReceiverWith(message);
+        var (dlq, sent) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }), new ArtemisConsumerOptions { DeadLetterSender = dlq.Object }).PollAsync();
+
+        Assert.Equal(bytes, AmqpProperties.BodyBytes(sent()!));
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task VersionGatedMessageUnderDeleteStrategyIsAcceptedWithoutARecord()
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var (dlq, _) = DlqSender();
+        var options = new ArtemisConsumerOptions { DeadLetterSender = dlq.Object, UnknownUrn = UnknownUrnStrategy.Delete };
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }), options).PollAsync();
+
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task VersionGatedMessageWithDeadLetteringOffIsAcceptedAndDropped()
+    {
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var calls = 0;
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => calls++)).PollAsync();
+
+        Assert.Equal(0, calls);
+        receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

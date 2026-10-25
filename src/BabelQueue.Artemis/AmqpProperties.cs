@@ -76,8 +76,26 @@ internal static class AmqpProperties
         return message;
     }
 
-    /// <summary>Forward an undecodable message's raw body to the DLQ (no envelope to annotate).</summary>
+    /// <summary>A DLQ message whose body is the given text (no envelope to annotate).</summary>
     public static Message Raw(string body) => new(body);
+
+    /// <summary>
+    /// A copy of the incoming body for the raw version-gate record (ADR-0037): the bytes exactly as received. A binary
+    /// (<c>data</c> section) body stays binary, a text (<c>amqp-value</c> string) body stays text.
+    /// </summary>
+    public static Message RawLike(Message incoming) =>
+        incoming.Body is byte[] bytes
+            ? new Message { BodySection = new Data { Binary = bytes } }
+            : new Message(Text(incoming));
+
+    /// <summary>The message body as bytes (AMQP value string UTF-8-encoded, or the binary body as is).</summary>
+    public static byte[] BodyBytes(Message message) =>
+        message.Body switch
+        {
+            null => Array.Empty<byte>(),
+            byte[] bytes => bytes,
+            _ => Encoding.UTF8.GetBytes(message.Body.ToString() ?? string.Empty),
+        };
 
     /// <summary>The message body as text (AMQP value string, or UTF-8-decoded binary).</summary>
     public static string Text(Message message)

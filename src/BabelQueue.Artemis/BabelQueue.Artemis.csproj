@@ -30,7 +30,7 @@
 
   <ItemGroup>
     <PackageReference Include="AMQPNetLite.Core" Version="2.5.3" />
-    <PackageReference Include="BabelQueue.Core" Version="1.0.0" />
+    <PackageReference Include="BabelQueue.Core" Version="1.13.0" />
   </ItemGroup>
 
   <ItemGroup>
