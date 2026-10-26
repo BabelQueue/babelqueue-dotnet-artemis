@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-26
+
 Implements ADR-0037 decisions 1 and 2. The envelope stays at `schema_version: 1`; every change is a consumer-side settle
 decision. Ships as a **MINOR**.
 
