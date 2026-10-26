@@ -93,7 +93,9 @@ strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 
 **Custom receivers.** `IAmqpReceiver.ModifyAsync` is a default interface method that falls back to `ReleaseAsync`; a custom `IAmqpReceiver` (not `AmqpReceiverLink`) must override it with a *modified / delivery-failed* settle, otherwise a throwing handler redelivers without bumping the counter.
 
-**Schema-version gate.** Before decoding, the consumer reads the `bq_schema_version` application property (underscores — ADR-0017). Absent or blank decodes as usual; any other value must be exactly `"1"`, otherwise the raw message is forwarded to `<queue>.dlq` and accepted without being decoded (with no `DeadLetterSender` configured the forward is a no-op, so the message is just accepted — it degrades to delete). If the DLQ write itself fails, the message is **not** accepted: it is `Release`d for redelivery (a plain AMQP *released* outcome, not *modified / delivery-failed*), reported via `OnError` (after the settle; a throwing `OnError` cannot leave it unsettled), the consumer backs off for one `ReceiveTimeout` and `RunAsync` keeps running.
+**Schema-version gate (ADR-0037).** Before decoding, the consumer reads the `bq_schema_version` application property (underscores — ADR-0017). Absent or blank decodes as usual; any other value must be exactly `"1"`, otherwise the message is settled on its **first delivery** (whatever the counters say), never decoded, never retried, never handed to a handler: under `UnknownUrn = delete` it is accepted (dropped); with a `DeadLetterSender` its body is written **exactly as received** (byte for byte, no `dead_letter` block; a binary body stays binary) to `<queue>.dlq` and then accepted; with no `DeadLetterSender` it is accepted and dropped (a `Trace` warning). Only the configured `UnknownUrn` strategy is read (`release` behaves as `fail`). If the DLQ write itself fails, the message is **not** accepted: it is `Release`d for redelivery (a plain AMQP *released* outcome, not *modified / delivery-failed*), reported via `OnError` (after the settle; a throwing `OnError` cannot leave it unsettled), the consumer backs off for one `ReceiveTimeout` and `RunAsync` keeps running.
+
+**Poison (ADR-0037).** A body that can never reach a handler — invalid UTF-8, not a JSON object, an object without a valid `job`/`urn`, or any other non-conformant envelope — is never retried. With a `DeadLetterSender` it is written to `<queue>.dlq` as the ADR-0035 record (`reason: "poison"`; a strict JSON object is spliced byte for byte, anything else is wrapped as `raw`, base64 for invalid UTF-8) and accepted only after the write; a failed write releases it exactly like the gate. `dead_letter.original_queue` is `ArtemisConsumerOptions.Queue`, else the `DeadLetterSender` address without its `.dlq` suffix. Under `UnknownUrn = delete`, or with no `DeadLetterSender`, it is accepted and dropped. **Behaviour change:** before, a non-conformant body was forwarded raw to `<queue>.dlq` (no `dead_letter` block).
 
 > `AmqpSenderLink` / `AmqpReceiverLink` wrap the AMQPNetLite links; the publisher and consumer
 > depend on the `IAmqpSender` / `IAmqpReceiver` seams, so they unit-test against mocks with no
@@ -111,7 +113,7 @@ strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 | `meta.lang` | application property `bq-source-lang` |
 | `attempts` | `max(body, delivery-count)` (AMQP counter is 0-based) |
 | reserve / ack | `Receive` → process → **`Accept`** |
-| retry / delay | `Modified{delivery-failed}` redelivery (handler failure) · plain `Release` (gate DLQ-write failure, `release` unknown-URN) · native `x-opt-delivery-time` |
+| retry / delay | `Modified{delivery-failed}` redelivery (handler failure) · plain `Release` (gate / poison DLQ-write failure, `release` unknown-URN) · native `x-opt-delivery-time` |
 | dead-letter | `<queue>.dlq` + `dead_letter` block (alongside the native DLA) |
 
 The `bq-` application-property values are strings (integers as decimal, e.g. `"1"`); `bq-app-id`
@@ -125,7 +127,7 @@ dotnet test
 ```
 
 The AMQP send/receive seams are mocked with Moq and `Amqp.Message` is constructed directly — no
-Artemis, no network. xUnit, ≥90% line coverage (Coverlet).
+Artemis, no network. The vendored conformance suite (v1.8.0: `poison_dlq`, `version_gate_artemis`) is run too. xUnit, ≥90% line coverage (Coverlet).
 
 ## License
 
