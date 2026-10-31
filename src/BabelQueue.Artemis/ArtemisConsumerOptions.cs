@@ -13,6 +13,16 @@ public sealed class ArtemisConsumerOptions
     /// </summary>
     public IAmqpSender? DeadLetterSender { get; set; }
 
+    /// <summary>
+    /// Optional dead-letter observer (ADR-0039 section 5.1), called once per message the consumer wrote to the
+    /// <see cref="DeadLetterSender"/>, right after the write is confirmed: an exhausted <c>failed</c> message, an
+    /// unmapped URN under <c>dead_letter</c>, a poison body, or a raw message rejected by the schema-version gate
+    /// (empty reason). Not called when the write fails (the message is released), for a redelivery, when the broker
+    /// dead-letters on its own, or when no sender is set. An observer exception is caught and logged; it never
+    /// changes the settle outcome. Needs a <c>BabelQueue.Core</c> that ships <see cref="IDeadLetterObserver"/>.
+    /// </summary>
+    public IDeadLetterObserver? DeadLetterObserver { get; set; }
+
     /// <summary>Attempts before terminal dead-lettering (default 3).</summary>
     public int MaxTries { get; set; } = 3;
 
