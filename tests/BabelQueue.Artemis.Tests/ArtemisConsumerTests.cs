@@ -684,4 +684,35 @@ public sealed class ArtemisConsumerTests
         Assert.Throws<ArgumentNullException>(() => new ArtemisConsumer(null!, new Dictionary<string, BabelHandler>()));
         Assert.Throws<ArgumentNullException>(() => new ArtemisConsumer(receiver.Object, null!));
     }
+
+    [Fact]
+    public async Task HandlerReceivesThePublishedTraceparentThroughTheConsumer()
+    {
+        const string traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders");
+        Message? published = null;
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .Callback<Message, CancellationToken>((m, _) => published = m)
+            .Returns(Task.CompletedTask);
+        await new ArtemisPublisher(sender.Object).PublishWithHeadersAsync(
+            Urn, null, new Dictionary<string, string> { ["traceparent"] = traceparent }, "trace-1");
+
+        IReadOnlyDictionary<string, string>? seen = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, message, _) =>
+            {
+                seen = ArtemisTraceHeaders.Extract(message);
+                return Task.CompletedTask;
+            },
+        };
+
+        await new ArtemisConsumer(ReceiverWith(published).Object, handlers).PollAsync();
+
+        Assert.NotNull(seen);
+        Assert.Equal(traceparent, seen!["traceparent"]);
+        Assert.DoesNotContain(AmqpProperties.Attempts, seen.Keys);
+    }
 }

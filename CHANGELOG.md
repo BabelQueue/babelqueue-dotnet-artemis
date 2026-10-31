@@ -9,6 +9,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **W3C `traceparent` propagation (ADR-0028).** `ArtemisPublisher.PublishWithHeadersAsync(urn, data, headers, traceId, delay)` overlays an out-of-band header carrier (e.g. the one `Telemetry.PublishAsync(..., headers, ...)` fills from the producer span) as string AMQP application properties (`traceparent` / `tracestate` are JMS-legal names), **beside** the frozen envelope and the `bq-` / `bq_` contract projection, never inside the body. The transport-owned `bq_*` properties (including `bq_delay`) are always dropped from the carrier (parity with the Go reference), keys already present are never overwritten and empty keys/values are skipped; a `null`/empty carrier is identical to `PublishAsync`.
+- `ArtemisTraceHeaders.Extract(...)`: surfaces a received message's application properties as a flat map to hand to `Telemetry.Wrap(handler, headers)`, so the consumer span becomes a true child of the producer span. The transport-owned contract keys are left out of the map, so it can be handed back to `PublishWithHeadersAsync` safely. With no `traceparent` the core falls back to the v0.1 `trace_id` mapping. The `BabelHandler` signature is unchanged; call `ArtemisTraceHeaders.Extract(message)` inside the handler.
+- Envelope unchanged (`schema_version` stays 1); additive, no wire change.
+
 ## [1.2.0] - 2026-10-26
 
 Implements ADR-0037 decisions 1 and 2. The envelope stays at `schema_version: 1`; every change is a consumer-side settle
