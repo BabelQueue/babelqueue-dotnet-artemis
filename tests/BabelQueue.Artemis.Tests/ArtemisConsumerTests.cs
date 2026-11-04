@@ -684,4 +684,272 @@ public sealed class ArtemisConsumerTests
         Assert.Throws<ArgumentNullException>(() => new ArtemisConsumer(null!, new Dictionary<string, BabelHandler>()));
         Assert.Throws<ArgumentNullException>(() => new ArtemisConsumer(receiver.Object, null!));
     }
+
+    [Fact]
+    public async Task HandlerReceivesThePublishedTraceparentThroughTheConsumer()
+    {
+        const string traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders");
+        Message? published = null;
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .Callback<Message, CancellationToken>((m, _) => published = m)
+            .Returns(Task.CompletedTask);
+        await new ArtemisPublisher(sender.Object).PublishWithHeadersAsync(
+            Urn, null, new Dictionary<string, string> { ["traceparent"] = traceparent }, "trace-1");
+
+        IReadOnlyDictionary<string, string>? seen = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, message, _) =>
+            {
+                seen = ArtemisTraceHeaders.Extract(message);
+                return Task.CompletedTask;
+            },
+        };
+
+        await new ArtemisConsumer(ReceiverWith(published).Object, handlers).PollAsync();
+
+        Assert.NotNull(seen);
+        Assert.Equal(traceparent, seen!["traceparent"]);
+        Assert.DoesNotContain(AmqpProperties.Attempts, seen.Keys);
+    }
+
+    // ---- Dead-letter observer (ADR-0039 section 5.1-5.3) ----
+
+    private sealed class RecordingObserver : IDeadLetterObserver
+    {
+        public List<DeadLetterEvent> Events { get; } = new();
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent) => Events.Add(deadLetterEvent);
+    }
+
+    private sealed class ThrowingObserver : IDeadLetterObserver
+    {
+        public int Calls { get; private set; }
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent)
+        {
+            Calls++;
+            throw new InvalidOperationException("observer exploded");
+        }
+    }
+
+    private static Mock<IAmqpSender> FailingDlqSender()
+    {
+        var sender = new Mock<IAmqpSender>();
+        sender.SetupGet(s => s.Address).Returns("orders.dlq");
+        sender
+            .Setup(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dlq down"));
+        return sender;
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceWhenRetriesAreExhausted()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(Incoming(Body(2), Urn, 0));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+        {
+            MaxTries = 3,
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "failed"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAnUnknownUrnUnderDeadLetter()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(Incoming(Body(0), Urn, 1));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), new ArtemisConsumerOptions
+        {
+            UnknownUrn = UnknownUrnStrategy.DeadLetter,
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAPoisonBody()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(Incoming("not-json", jmsType: null, deliveryCount: 0));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, new Dictionary<string, BabelHandler>(), new ArtemisConsumerOptions
+        {
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAVersionGatedRawBodyWithAnEmptyReason()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }), new ArtemisConsumerOptions
+        {
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", string.Empty), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverQueueIsMetaQueueNotTheDerivedQueueWhenRetriesAreExhausted()
+    {
+        // meta.queue ("billing") differs from the queue derived from the DLQ address ("orders"): meta.queue wins.
+        var observer = new RecordingObserver();
+        var body = EnvelopeCodec.Encode(
+            EnvelopeCodec.Make(Urn, new Dictionary<string, object?> { ["order_id"] = 1 }, "billing", "trace-1")
+                with { Attempts = 2 });
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(ReceiverWith(Incoming(body, Urn, 0)).Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+        {
+            MaxTries = 3,
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("billing", "orders.dlq", "failed"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverQueueFollowsTheConfiguredQueueForARawBody()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(WithSchemaVersion(Body(0), "2"));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }), new ArtemisConsumerOptions
+        {
+            Queue = "billing",
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal("billing", Assert.Single(observer.Events).Queue);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledForARedelivery()
+    {
+        var observer = new RecordingObserver();
+        var receiver = ReceiverWith(Incoming(Body(0), Urn, 0));
+        var (dlq, _) = DlqSender();
+
+        await new ArtemisConsumer(receiver.Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+        {
+            MaxTries = 3,
+            DeadLetterSender = dlq.Object,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        receiver.Verify(
+            r => r.ModifyAsync(It.IsAny<Message>(), true, false, It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenDeadLetteringIsOff()
+    {
+        var observer = new RecordingObserver();
+
+        foreach (var message in new[] { Incoming(Body(2), Urn, 0), Incoming("not-json", null, 0), WithSchemaVersion(Body(0), "2") })
+        {
+            await new ArtemisConsumer(ReceiverWith(message).Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+            {
+                MaxTries = 3,
+                DeadLetterObserver = observer,
+            }).PollAsync();
+        }
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheDeadLetterWriteFails()
+    {
+        var observer = new RecordingObserver();
+
+        // Poison and version gate: released, not accepted.
+        foreach (var message in new[] { Incoming("not-json", null, 0), WithSchemaVersion(Body(0), "2") })
+        {
+            var receiver = ReceiverWith(message);
+
+            await new ArtemisConsumer(receiver.Object, Handler(_ => { }), new ArtemisConsumerOptions
+            {
+                DeadLetterSender = FailingDlqSender().Object,
+                ReceiveTimeout = TimeSpan.FromMilliseconds(1),
+                DeadLetterObserver = observer,
+            }).PollAsync();
+
+            receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+            receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        // Exhausted handler: the failed write escapes the poll and the message is not accepted.
+        var exhausted = ReceiverWith(Incoming(Body(2), Urn, 0));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new ArtemisConsumer(exhausted.Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+            {
+                MaxTries = 3,
+                DeadLetterSender = FailingDlqSender().Object,
+                DeadLetterObserver = observer,
+            }).PollAsync());
+        exhausted.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task AThrowingObserverDoesNotChangeTheSettleOutcome()
+    {
+        var messages = new[]
+        {
+            Incoming(Body(2), Urn, 0),
+            Incoming("not-json", null, 0),
+            WithSchemaVersion(Body(0), "2"),
+        };
+
+        foreach (var message in messages)
+        {
+            var observer = new ThrowingObserver();
+            var receiver = ReceiverWith(message);
+            var (dlq, _) = DlqSender();
+
+            var count = await new ArtemisConsumer(receiver.Object, Handler(_ => { }, @throw: true), new ArtemisConsumerOptions
+            {
+                MaxTries = 3,
+                DeadLetterSender = dlq.Object,
+                DeadLetterObserver = observer,
+            }).PollAsync();
+
+            Assert.Equal(1, count);
+            Assert.Equal(1, observer.Calls);
+            dlq.Verify(s => s.SendAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+            receiver.Verify(r => r.AcceptAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Once);
+            receiver.Verify(r => r.ReleaseAsync(It.IsAny<Message>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+    }
 }

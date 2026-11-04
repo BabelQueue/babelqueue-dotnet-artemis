@@ -96,6 +96,7 @@ public sealed class ArtemisConsumer
                     $"Rejected an Artemis message: unsupported {AmqpProperties.SchemaVersion} property "
                     + $"'{declaredVersion}' (supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
                 "schema-version-gated",
+                string.Empty, // a raw body: no dead_letter block, so no reason
                 cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -122,6 +123,7 @@ public sealed class ArtemisConsumer
                     QueueName(message),
                     envelope.Attempts))),
                 cause,
+                "poison",
                 "poison",
                 cancellationToken,
                 envelope).ConfigureAwait(false);
@@ -218,7 +220,7 @@ public sealed class ArtemisConsumer
                 await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
                 return;
             case UnknownUrnStrategy.DeadLetter:
-                await DeadLetterAsync(envelope, "unknown_urn", null, cancellationToken).ConfigureAwait(false);
+                await DeadLetterAsync(message, envelope, "unknown_urn", null, cancellationToken).ConfigureAwait(false);
                 await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
                 return;
             case UnknownUrnStrategy.Release:
@@ -243,7 +245,7 @@ public sealed class ArtemisConsumer
         }
         else if (_options.DeadLetterSender is not null)
         {
-            await DeadLetterAsync(envelope, "failed", error, cancellationToken).ConfigureAwait(false);
+            await DeadLetterAsync(message, envelope, "failed", error, cancellationToken).ConfigureAwait(false);
             await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
         }
         else
@@ -252,7 +254,7 @@ public sealed class ArtemisConsumer
         }
     }
 
-    private async Task DeadLetterAsync(Envelope envelope, string reason, Exception? error, CancellationToken cancellationToken)
+    private async Task DeadLetterAsync(Message message, Envelope envelope, string reason, Exception? error, CancellationToken cancellationToken)
     {
         var sender = _options.DeadLetterSender;
         if (sender is null)
@@ -262,7 +264,18 @@ public sealed class ArtemisConsumer
         var annotated = DeadLetters.Annotate(
             envelope, reason, OriginalQueue(envelope), envelope.Attempts, error?.Message, error?.GetType().FullName);
         await sender.SendAsync(AmqpProperties.ToMessage(annotated), cancellationToken).ConfigureAwait(false);
+        NotifyDeadLetter(
+            string.IsNullOrWhiteSpace(envelope.Meta?.Queue) ? QueueName(message) : envelope.Meta!.Queue!,
+            sender,
+            reason);
     }
+
+    /// <summary>
+    /// Reports a DLQ write the broker just confirmed (ADR-0039 section 5.1). Goes through
+    /// <see cref="DeadLetterObservers.NotifySafely"/>, so an observer failure can never change the settle outcome.
+    /// </summary>
+    private void NotifyDeadLetter(string queue, IAmqpSender sender, string reason)
+        => _options.DeadLetterObserver.NotifySafely(new DeadLetterEvent(queue, sender.Address, reason));
 
     /// <summary>
     /// ADR-0037 decisions 1 and 2: settle a delivery that is terminal on its first delivery (a version-gated message or a
@@ -270,12 +283,15 @@ public sealed class ArtemisConsumer
     /// otherwise the record from <paramref name="build"/> is written to the DLQ and the message accepted only after the write
     /// succeeded. A failed write <c>Release</c>s it (never accepted, never retried by the SDK; the rejection repeats, so the
     /// write is tried again), reports it and backs off for one receive interval. Reporting is isolated from settling.
+    /// After a confirmed write the dead-letter observer (ADR-0039 section 5.1) is told once with <paramref name="reason"/>
+    /// (empty for a raw version-gated body) and the consumed queue; a failed write never reaches it.
     /// </summary>
     private async Task SettleToDeadLetterAsync(
         Message message,
         Func<Message> build,
         BabelQueueException rejected,
         string kind,
+        string reason,
         CancellationToken cancellationToken,
         Envelope? envelope = null)
     {
@@ -326,6 +342,7 @@ public sealed class ArtemisConsumer
             return;
         }
 
+        NotifyDeadLetter(QueueName(message), sender, reason);
         await _receiver.AcceptAsync(message, cancellationToken).ConfigureAwait(false);
         SafeReport(rejected, message, envelope);
     }

@@ -25,10 +25,22 @@ internal static class AmqpProperties
     public const string Delay = "bq_delay";
     public const string AppIdValue = "babelqueue";
 
+    /// <summary>
+    /// The application properties the transport owns (the §7.2 <c>bq_</c> projection plus <c>bq_delay</c>). They are
+    /// never accepted from, nor surfaced as, out-of-band transport headers (parity with the Go reference).
+    /// </summary>
+    private static readonly HashSet<string> Contract = new(StringComparer.Ordinal)
+    {
+        SchemaVersion, SourceLang, Attempts, AppId, Delay,
+    };
+
+    /// <summary>True when <paramref name="key"/> is a contract property the transport owns.</summary>
+    public static bool IsContract(string key) => Contract.Contains(key);
+
     private static readonly Symbol JmsType = new("x-opt-jms-type");
     private static readonly Symbol ScheduledDelivery = new("x-opt-delivery-time");
 
-    public static Message ToMessage(Envelope envelope, TimeSpan? delay = null)
+    public static Message ToMessage(Envelope envelope, TimeSpan? delay = null, IReadOnlyDictionary<string, string>? headers = null)
     {
         var message = new Message(EnvelopeCodec.Encode(envelope))
         {
@@ -73,7 +85,37 @@ internal static class AmqpProperties
             message.MessageAnnotations.Map[ScheduledDelivery] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + ms;
         }
 
+        Merge(message, headers);
+
         return message;
+    }
+
+    /// <summary>
+    /// Overlays the out-of-band string <paramref name="headers"/> (e.g. a W3C <c>traceparent</c>, ADR-0028) onto the
+    /// message's application properties, beside the <c>bq_</c> contract projection. An existing property is never
+    /// overwritten, a contract property name (<see cref="IsContract"/>, including <c>bq_delay</c>) is always dropped,
+    /// and empty keys/values are skipped. Keys are applied in
+    /// ordinal order so the result is deterministic. A <c>null</c>/empty map is a no-op.
+    /// </summary>
+    public static void Merge(Message message, IReadOnlyDictionary<string, string>? headers)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (headers is null || headers.Count == 0)
+        {
+            return;
+        }
+
+        message.ApplicationProperties ??= new ApplicationProperties();
+        foreach (var key in headers.Keys.OrderBy(static k => k, StringComparer.Ordinal))
+        {
+            var value = headers[key];
+            if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(value) || IsContract(key) || message.ApplicationProperties.Map.ContainsKey(key))
+            {
+                continue;
+            }
+
+            message.ApplicationProperties.Map[key] = value;
+        }
     }
 
     /// <summary>A DLQ message whose body is the given text (no envelope to annotate).</summary>
@@ -125,5 +167,44 @@ internal static class AmqpProperties
     {
         var header = message.Header;
         return header is null ? 0 : (int)header.DeliveryCount;
+    }
+}
+
+/// <summary>
+/// Out-of-band transport-header carrier for Artemis (ADR-0028). A W3C <c>traceparent</c> (and <c>tracestate</c>)
+/// rides as a string AMQP application property <b>beside</b> the frozen envelope — never inside it — next to the
+/// §7 <c>bq_</c> projection (the names are JMS-legal identifiers, so a Java/JMS peer reads them too). This is the
+/// consume-side half: it surfaces a received message's application properties as a flat map a handler hands to
+/// <c>Telemetry.Wrap(handler, headers)</c>, so the consumer span becomes a true child of the producer span. With no
+/// <c>traceparent</c> the core falls back to the v0.1 <c>trace_id</c> mapping.
+/// </summary>
+public static class ArtemisTraceHeaders
+{
+    /// <summary>
+    /// The string-valued application properties of a received message as a flat map (empty when it has none).
+    /// Only out-of-band headers (e.g. <c>traceparent</c>) surface: the <c>bq_</c> contract properties the transport
+    /// owns are left out, so handing the map back to <c>PublishWithHeadersAsync</c> cannot re-inject them. Non-string
+    /// and empty values are skipped.
+    /// </summary>
+    public static Dictionary<string, string> Extract(Message message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+
+        var headers = new Dictionary<string, string>(StringComparer.Ordinal);
+        var properties = message.ApplicationProperties;
+        if (properties is null)
+        {
+            return headers;
+        }
+
+        foreach (var entry in properties.Map)
+        {
+            if (entry.Key is string key && entry.Value is string value && value.Length > 0 && !AmqpProperties.IsContract(key))
+            {
+                headers[key] = value;
+            }
+        }
+
+        return headers;
     }
 }

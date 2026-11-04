@@ -27,15 +27,38 @@ public sealed class ArtemisPublisher
     /// returns the message id (<c>meta.id</c>). A positive <paramref name="delay"/> schedules
     /// native delayed delivery.
     /// </summary>
-    public async Task<string> PublishAsync(
+    public Task<string> PublishAsync(
         string urn,
         IReadOnlyDictionary<string, object?>? data = null,
         string? traceId = null,
         TimeSpan? delay = null,
         CancellationToken cancellationToken = default)
+        => PublishWithHeadersAsync(urn, data, headers: null, traceId, delay, cancellationToken);
+
+    /// <summary>
+    /// The header-aware (ADR-0028) counterpart of
+    /// <see cref="PublishAsync(string, IReadOnlyDictionary{string, object?}?, string?, TimeSpan?, CancellationToken)"/>:
+    /// in addition to the §7 projection it overlays the out-of-band <paramref name="headers"/> (e.g. a W3C
+    /// <c>traceparent</c> from <c>Telemetry.PublishAsync(..., headers, ...)</c>) as string application properties.
+    /// The headers ride <b>beside</b> the frozen envelope, never inside it, and never overwrite a <c>bq_</c> contract
+    /// property. A <c>null</c>/empty header map is identical to <c>PublishAsync</c>.
+    /// </summary>
+    /// <param name="urn">The message URN to publish.</param>
+    /// <param name="data">The message payload, or <c>null</c> for an empty body.</param>
+    /// <param name="headers">The out-of-band transport headers to ride beside the envelope.</param>
+    /// <param name="traceId">An existing trace id to continue, or <c>null</c> to mint one.</param>
+    /// <param name="delay">A positive delay schedules native delayed delivery.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<string> PublishWithHeadersAsync(
+        string urn,
+        IReadOnlyDictionary<string, object?>? data,
+        IReadOnlyDictionary<string, string>? headers,
+        string? traceId = null,
+        TimeSpan? delay = null,
+        CancellationToken cancellationToken = default)
     {
         var envelope = EnvelopeCodec.Make(urn, data, _sender.Address, traceId);
-        var message = AmqpProperties.ToMessage(envelope, delay);
+        var message = AmqpProperties.ToMessage(envelope, delay, headers);
         await _sender.SendAsync(message, cancellationToken).ConfigureAwait(false);
         return envelope.Meta?.Id ?? string.Empty;
     }
