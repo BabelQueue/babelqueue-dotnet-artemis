@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   release:
@@ -25,6 +24,30 @@ jobs:
 
       - name: Pack
         run: dotnet pack src/BabelQueue.Artemis/BabelQueue.Artemis.csproj -c Release -o artifacts
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+          retention-days: 1
+
+  # Runs only after build + tests passed. The only job (besides the dry run) that can request
+  # an OIDC token, so third-party build/test code never sees ACTIONS_ID_TOKEN_REQUEST_*.
+  publish:
+    if: github.event_name == 'push'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts
 
       - name: NuGet login (Trusted Publishing)
         id: nuget-login
@@ -49,6 +72,8 @@ jobs:
   verify-trusted-publishing:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
     steps:
       - name: NuGet login (Trusted Publishing)
         id: nuget-login
