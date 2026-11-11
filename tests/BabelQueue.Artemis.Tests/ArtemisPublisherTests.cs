@@ -260,4 +260,109 @@ public sealed class ArtemisPublisherTests
 
         Assert.Equal(Traceparent, Assert.Single(map).Value);
     }
+
+    // O6: the envelope Telemetry.PublishAsync builds is the one that is sent, so the producer span's
+    // messaging.message.id is the meta.id on the wire (and the traceparent rides beside the envelope).
+    [Fact]
+    public async Task TelemetryPublishEnvelopeRecordsTheWireMessageId()
+    {
+        var (sender, sent) = SenderOn("orders");
+        var publisher = new ArtemisPublisher(sender.Object);
+        const string envelopeUrn = "urn:babel:orders:envelope-id";
+        var activities = new List<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == Telemetry.ActivitySourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity =>
+            {
+                if (activity.Kind == ActivityKind.Producer && Equals(activity.GetTagItem("babelqueue.urn"), envelopeUrn))
+                {
+                    lock (activities)
+                    {
+                        activities.Add(activity);
+                    }
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        var headers = new Dictionary<string, string>();
+        var id = await Telemetry.PublishAsync(
+            envelopeUrn,
+            new Dictionary<string, object?> { ["order_id"] = 7 },
+            headers,
+            env => publisher.PublishEnvelopeAsync(env, headers),
+            "orders");
+
+        var producerSpan = Assert.Single(activities);
+        var message = sent()!;
+        var body = AmqpProperties.Text(message);
+        var traceparent = message.ApplicationProperties?.Map.ContainsKey("traceparent") == true
+            ? (string)message.ApplicationProperties.Map["traceparent"]
+            : null;
+        var wire = EnvelopeCodec.Decode(body);
+
+        Assert.Equal(id, wire.Meta!.Id);
+        Assert.Equal(wire.Meta.Id, producerSpan.GetTagItem("messaging.message.id"));
+        Assert.Equal(Telemetry.UuidOf(producerSpan.TraceId), wire.TraceId);
+        Assert.Equal(wire.TraceId, producerSpan.GetTagItem("messaging.message.conversation_id"));
+        Assert.Equal(EnvelopeCodec.SchemaVersion, wire.Meta.SchemaVersion);
+        Assert.Equal(headers["traceparent"], traceparent);
+        Assert.Contains(producerSpan.TraceId.ToHexString(), traceparent, StringComparison.Ordinal);
+        Assert.DoesNotContain("traceparent", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PublishEnvelopeSendsTheGivenEnvelopeUnchanged()
+    {
+        var (sender, sent) = SenderOn("orders");
+        var publisher = new ArtemisPublisher(sender.Object);
+        var made = EnvelopeCodec.Make(
+            "urn:babel:orders:created", new Dictionary<string, object?> { ["order_id"] = 7 }, "orders", "trace-fixed");
+        var envelope = made with
+        {
+            Extras = new Dictionary<string, JsonElement> { ["x_tenant"] = JsonSerializer.SerializeToElement("t1") },
+            Meta = made.Meta! with
+            {
+                Extras = new Dictionary<string, JsonElement> { ["x_region"] = JsonSerializer.SerializeToElement("eu") },
+            },
+        };
+
+        var id = await publisher.PublishEnvelopeAsync(envelope);
+
+        var message = sent()!;
+        var body = AmqpProperties.Text(message);
+        var traceparent = message.ApplicationProperties?.Map.ContainsKey("traceparent") == true
+            ? (string)message.ApplicationProperties.Map["traceparent"]
+            : null;
+        Assert.Equal(envelope.Meta!.Id, id);
+        Assert.Equal(EnvelopeCodec.Encode(envelope), body);
+        var wire = EnvelopeCodec.Decode(body);
+        Assert.Equal("trace-fixed", wire.TraceId);
+        Assert.Equal(EnvelopeCodec.SchemaVersion, wire.Meta!.SchemaVersion);
+        Assert.Equal(envelope.Meta.Id, wire.Meta.Id);
+        Assert.Equal("t1", wire.Extras!["x_tenant"].GetString());
+        Assert.Equal("eu", wire.Meta.Extras!["x_region"].GetString());
+        Assert.Null(traceparent);
+    }
+
+    // Documents the PublishEnvelopeAsync contract: meta.queue is whatever the envelope carries. Telemetry stamps
+    // its queue argument (default "default"), not this publisher's target, so callers must pass the queue.
+    [Fact]
+    public async Task TelemetryPublishWithoutAQueueArgumentStampsDefaultMetaQueue()
+    {
+        var (sender, sent) = SenderOn("orders");
+        var publisher = new ArtemisPublisher(sender.Object);
+        await Telemetry.PublishAsync(
+            "urn:babel:orders:created", null, env => publisher.PublishEnvelopeAsync(env));
+
+        var message = sent()!;
+        var body = AmqpProperties.Text(message);
+        var traceparent = message.ApplicationProperties?.Map.ContainsKey("traceparent") == true
+            ? (string)message.ApplicationProperties.Map["traceparent"]
+            : null;
+        Assert.Equal("default", EnvelopeCodec.Decode(body).Meta!.Queue);
+        Assert.Null(traceparent);
+    }
 }
